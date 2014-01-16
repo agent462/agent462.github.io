@@ -4,7 +4,7 @@
   <title><![CDATA[agent462]]></title>
   <link href="http://agent462.github.io/atom.xml" rel="self"/>
   <link href="http://agent462.github.io/"/>
-  <updated>2014-01-13T21:28:46-06:00</updated>
+  <updated>2014-01-15T20:12:12-06:00</updated>
   <id>http://agent462.github.io/</id>
   <author>
     <name><![CDATA[agent462]]></name>
@@ -12,5 +12,558 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[Sensu: Automated Decommission of Clients]]></title>
+    <link href="http://agent462.github.io/blog/2014/01/14/sensu-automated-decommission-of-clients/"/>
+    <updated>2014-01-14T21:42:44-06:00</updated>
+    <id>http://agent462.github.io/blog/2014/01/14/sensu-automated-decommission-of-clients</id>
+    <content type="html"><![CDATA[<p>Awhile back, I wrote a <a href="https://github.com/agent462/sensu-handler-awsdecomm">handler</a> to decommission clients from sensu and chef when they had been terminated or shut down in AWS.</p>
+
+<p>The key to writing your own decommission handler is to inspect nodes that are firing <a href="http://sensuapp.org/docs/0.12/keepalives">keepalive</a> events.</p>
+
+<h2>Keepalives</h2>
+
+<p>Let&rsquo;s start by doing a review of what Sensu keepalive checks are.  Keepalive checks publish data about the client with a current timestamp every 20 seconds.  The server inspects this keepalive data for clients that have passed a given threshold.  The threshold is configurable but the defaults will warn you at 120 seconds and go critical at 180 seconds.</p>
+
+<p>Keepalive checks will help notify you in the event of a network partition, excessive packet loss, server failure, configuration issues or a server that is under excessive load, etc.</p>
+
+<h2>Decomm Handler</h2>
+
+<p>We&rsquo;re going to exploit the keepalives feature to use in determining if a server should be decommissioned. This is going to assume you have some means to automatically determine a servers state.  This could be from a cloud provider, a registry service or other state provider.</p>
+
+<p>Let&rsquo;s configure a client to send keepalive events to our new handler called <code>decommission</code>.  If you don&rsquo;t want to have a different handler, you can use the default set.</p>
+
+<figure class='code'><figcaption><span>client.json </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class='json'><span class='line'><span class="p">{</span>
+</span><span class='line'>  <span class="nt">&quot;client&quot;</span><span class="p">:</span> <span class="p">{</span>
+</span><span class='line'>    <span class="nt">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;i-e43ad7s8&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;address&quot;</span><span class="p">:</span> <span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;keepalive&quot;</span><span class="p">:</span> <span class="p">{</span>
+</span><span class='line'>      <span class="nt">&quot;thresholds&quot;</span><span class="p">:</span> <span class="p">{</span>
+</span><span class='line'>        <span class="nt">&quot;warning&quot;</span><span class="p">:</span> <span class="mi">10</span><span class="p">,</span>
+</span><span class='line'>        <span class="nt">&quot;critical&quot;</span><span class="p">:</span> <span class="mi">300</span>
+</span><span class='line'>      <span class="p">},</span>
+</span><span class='line'>      <span class="nt">&quot;handlers&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;decommission&quot;</span><span class="p">]</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>  <span class="p">}</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Let&rsquo;s start with some baby steps on writing a new handler.  We&rsquo;re going to create a simple ruby file and start with the most basic logic.</p>
+
+<figure class='code'><figcaption><span>decomm.rb </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class='ruby'><span class='line'><span class="nb">require</span> <span class="s1">&#39;rubygems&#39;</span> <span class="k">if</span> <span class="no">RUBY_VERSION</span> <span class="o">&lt;</span> <span class="s1">&#39;1.9.0&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;sensu-handler&#39;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">class</span> <span class="nc">Decomm</span> <span class="o">&lt;</span> <span class="ss">Sensu</span><span class="p">:</span><span class="ss">:Handler</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">handle</span>
+</span><span class='line'>    <span class="k">if</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;create&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="c1"># Check the state here</span>
+</span><span class='line'>    <span class="k">elsif</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;resolve&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="c1"># Send email on resolution.</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">end</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>You&rsquo;ll notice we required and extended <a href="https://github.com/sensu/sensu-plugin/blob/master/lib/sensu-handler.rb">sensu-handler</a>.  We then implemented a <code>handle</code> method.  This is the method that fires when a handler is triggered.  Some basic logic was placed to take different actions based on if it is a create action or resolve action.</p>
+
+<p>Now let&rsquo;s add some logic to check the AWS api if our server is terminated, shutting down or doesn&rsquo;t exist.</p>
+
+<figure class='code'><figcaption><span>decomm.rb </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class='ruby'><span class='line'><span class="nb">require</span> <span class="s1">&#39;rubygems&#39;</span> <span class="k">if</span> <span class="no">RUBY_VERSION</span> <span class="o">&lt;</span> <span class="s1">&#39;1.9.0&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;sensu-handler&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;aws-sdk&#39;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">class</span> <span class="nc">Decomm</span> <span class="o">&lt;</span> <span class="ss">Sensu</span><span class="p">:</span><span class="ss">:Handler</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">check_aws</span>
+</span><span class='line'>    <span class="sx">%w{ ec2.us-east-1.amazonaws.com }</span><span class="o">.</span><span class="n">each</span> <span class="k">do</span> <span class="o">|</span><span class="n">region</span><span class="o">|</span>
+</span><span class='line'>      <span class="n">ec2</span> <span class="o">=</span> <span class="ss">AWS</span><span class="p">:</span><span class="ss">:EC2</span><span class="o">.</span><span class="n">new</span><span class="p">(</span>
+</span><span class='line'>        <span class="ss">:access_key_id</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;access_key_id&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:secret_access_key</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;secret_access_key&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:ec2_endpoint</span> <span class="o">=&gt;</span> <span class="n">region</span>
+</span><span class='line'>      <span class="p">)</span>
+</span><span class='line'>
+</span><span class='line'>      <span class="n">instance_name</span> <span class="o">=</span> <span class="n">ec2</span><span class="o">.</span><span class="n">instances</span><span class="o">[</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]]</span>
+</span><span class='line'>      <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">exists?</span>
+</span><span class='line'>        <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> exists; Checking state&quot;</span>
+</span><span class='line'>        <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;terminated&quot;</span> <span class="o">||</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;shutting_down&quot;</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">; I will proceed with decommission activities.&quot;</span>
+</span><span class='line'>          <span class="c1"># This is where we will delete the client from Sensu  </span>
+</span><span class='line'>        <span class="k">else</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Client </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>          <span class="c1"># This is where we will send an email as a normal keepalive event</span>
+</span><span class='line'>        <span class="k">end</span>
+</span><span class='line'>      <span class="k">else</span>
+</span><span class='line'>        <span class="c1"># This is where we will delete the client from Sensu  </span>
+</span><span class='line'>      <span class="k">end</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">handle</span>
+</span><span class='line'>    <span class="k">if</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;create&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">check_aws</span>
+</span><span class='line'>    <span class="k">elsif</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;resolve&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="c1"># Send email on resolution.</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">end</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>We&rsquo;ve added a <code>check_aws</code> method that can loop through regions and check the availability of the client name which is the instance id in our example.  It doesn&rsquo;t really do anything yet.  We still need logic to delete the client from Sensu or treat this like a normal event.</p>
+
+<p>We also added a couple AWS settings so lets create the json config file for the values.</p>
+
+<figure class='code'><figcaption><span>decomm.json </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class='json'><span class='line'><span class="p">{</span>
+</span><span class='line'>  <span class="nt">&quot;decomm&quot;</span><span class="p">:{</span>
+</span><span class='line'>    <span class="nt">&quot;access_key_id&quot;</span><span class="p">:</span> <span class="s2">&quot;ACCESS_KEY_ID&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;secret_access_key&quot;</span><span class="p">:</span> <span class="s2">&quot;SECRET_ACCESS_KEY&quot;</span><span class="p">,</span>
+</span><span class='line'>  <span class="p">}</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Now that we can check the state of an instance in AWS let&rsquo;s create the logic to remove the server from Sensu.  This will be done via a simple API request using a method we inherit from the sensu-handler.</p>
+
+<figure class='code'><figcaption><span>decomm.rb </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class='ruby'><span class='line'><span class="nb">require</span> <span class="s1">&#39;rubygems&#39;</span> <span class="k">if</span> <span class="no">RUBY_VERSION</span> <span class="o">&lt;</span> <span class="s1">&#39;1.9.0&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;sensu-handler&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;aws-sdk&#39;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">class</span> <span class="nc">Decomm</span> <span class="o">&lt;</span> <span class="ss">Sensu</span><span class="p">:</span><span class="ss">:Handler</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">delete_sensu_client</span>
+</span><span class='line'>    <span class="nb">puts</span> <span class="s2">&quot;Sensu client </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is being deleted.&quot;</span>
+</span><span class='line'>    <span class="k">if</span> <span class="n">api_request</span><span class="p">(</span><span class="ss">:DELETE</span><span class="p">,</span> <span class="s1">&#39;/clients/&#39;</span> <span class="o">+</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="p">)</span><span class="o">.</span><span class="n">code</span> <span class="o">!=</span> <span class="s1">&#39;202&#39;</span>
+</span><span class='line'>      <span class="nb">puts</span> <span class="s2">&quot;Sensu API call failed&quot;</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">check_aws</span>
+</span><span class='line'>    <span class="sx">%w{ ec2.us-east-1.amazonaws.com }</span><span class="o">.</span><span class="n">each</span> <span class="k">do</span> <span class="o">|</span><span class="n">region</span><span class="o">|</span>
+</span><span class='line'>      <span class="n">ec2</span> <span class="o">=</span> <span class="ss">AWS</span><span class="p">:</span><span class="ss">:EC2</span><span class="o">.</span><span class="n">new</span><span class="p">(</span>
+</span><span class='line'>        <span class="ss">:access_key_id</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;access_key_id&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:secret_access_key</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;secret_access_key&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:ec2_endpoint</span> <span class="o">=&gt;</span> <span class="n">region</span>
+</span><span class='line'>      <span class="p">)</span>
+</span><span class='line'>
+</span><span class='line'>      <span class="n">instance_name</span> <span class="o">=</span> <span class="n">ec2</span><span class="o">.</span><span class="n">instances</span><span class="o">[</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]]</span>
+</span><span class='line'>      <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">exists?</span>
+</span><span class='line'>        <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> exists; Checking state&quot;</span>
+</span><span class='line'>        <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;terminated&quot;</span> <span class="o">||</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;shutting_down&quot;</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">; I will proceed with decommission activities.&quot;</span>
+</span><span class='line'>          <span class="n">delete_sensu_client</span>
+</span><span class='line'>        <span class="k">else</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Client </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>          <span class="c1"># This is where we will send an email as a normal keepalive event</span>
+</span><span class='line'>        <span class="k">end</span>
+</span><span class='line'>      <span class="k">else</span>
+</span><span class='line'>        <span class="n">delete_sensu_client</span>
+</span><span class='line'>      <span class="k">end</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">handle</span>
+</span><span class='line'>    <span class="k">if</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;create&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">check_aws</span>
+</span><span class='line'>    <span class="k">elsif</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;resolve&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="c1"># Send email on resolution.</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">end</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>We&rsquo;re now checking AWS for the instance existence and deleting it from Sensu. Let&rsquo;s add the logic to send an email.</p>
+
+<figure class='code'><figcaption><span>decomm.rb </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+</pre></td><td class='code'><pre><code class='ruby'><span class='line'><span class="nb">require</span> <span class="s1">&#39;rubygems&#39;</span> <span class="k">if</span> <span class="no">RUBY_VERSION</span> <span class="o">&lt;</span> <span class="s1">&#39;1.9.0&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;sensu-handler&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;aws-sdk&#39;</span>
+</span><span class='line'><span class="n">gem</span> <span class="s1">&#39;mail&#39;</span><span class="p">,</span> <span class="s1">&#39;~&gt; 2.4.0&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;mail&#39;</span>
+</span><span class='line'><span class="nb">require</span> <span class="s1">&#39;timeout&#39;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">class</span> <span class="nc">Decomm</span> <span class="o">&lt;</span> <span class="ss">Sensu</span><span class="p">:</span><span class="ss">:Handler</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">delete_sensu_client</span>
+</span><span class='line'>    <span class="nb">puts</span> <span class="s2">&quot;Sensu client </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is being deleted.&quot;</span>
+</span><span class='line'>    <span class="k">if</span> <span class="n">api_request</span><span class="p">(</span><span class="ss">:DELETE</span><span class="p">,</span> <span class="s1">&#39;/clients/&#39;</span> <span class="o">+</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="p">)</span><span class="o">.</span><span class="n">code</span> <span class="o">!=</span> <span class="s1">&#39;202&#39;</span>
+</span><span class='line'>      <span class="nb">puts</span> <span class="s2">&quot;Sensu API call failed&quot;</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">check_aws</span>
+</span><span class='line'>    <span class="sx">%w{ ec2.us-east-1.amazonaws.com }</span><span class="o">.</span><span class="n">each</span> <span class="k">do</span> <span class="o">|</span><span class="n">region</span><span class="o">|</span>
+</span><span class='line'>      <span class="n">ec2</span> <span class="o">=</span> <span class="ss">AWS</span><span class="p">:</span><span class="ss">:EC2</span><span class="o">.</span><span class="n">new</span><span class="p">(</span>
+</span><span class='line'>        <span class="ss">:access_key_id</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;access_key_id&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:secret_access_key</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s2">&quot;awsdecomm&quot;</span><span class="o">][</span><span class="s2">&quot;secret_access_key&quot;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:ec2_endpoint</span> <span class="o">=&gt;</span> <span class="n">region</span>
+</span><span class='line'>      <span class="p">)</span>
+</span><span class='line'>
+</span><span class='line'>      <span class="n">instance_name</span> <span class="o">=</span> <span class="n">ec2</span><span class="o">.</span><span class="n">instances</span><span class="o">[</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]]</span>
+</span><span class='line'>      <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">exists?</span>
+</span><span class='line'>        <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> exists; Checking state&quot;</span>
+</span><span class='line'>        <span class="k">if</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;terminated&quot;</span> <span class="o">||</span> <span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="o">.</span><span class="n">to_s</span> <span class="o">===</span> <span class="s2">&quot;shutting_down&quot;</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Instance </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">; I will proceed with decommission activities.&quot;</span>
+</span><span class='line'>          <span class="n">delete_sensu_client</span>
+</span><span class='line'>        <span class="k">else</span>
+</span><span class='line'>          <span class="nb">puts</span> <span class="s2">&quot;Client </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> is </span><span class="si">#{</span><span class="n">instance_name</span><span class="o">.</span><span class="n">status</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>          <span class="n">mail</span><span class="p">(</span><span class="s1">&#39;alert&#39;</span><span class="p">)</span>
+</span><span class='line'>          <span class="n">bail</span>
+</span><span class='line'>        <span class="k">end</span>
+</span><span class='line'>      <span class="k">else</span>
+</span><span class='line'>        <span class="vi">@body</span> <span class="o">&lt;&lt;</span> <span class="s2">&quot;AWS instance was not found </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">.&quot;</span>
+</span><span class='line'>        <span class="n">delete_sensu_client</span>
+</span><span class='line'>      <span class="k">end</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">mail</span><span class="p">(</span><span class="n">subject</span><span class="p">)</span>
+</span><span class='line'>    <span class="n">params</span> <span class="o">=</span> <span class="p">{</span>
+</span><span class='line'>      <span class="ss">:mail_to</span>   <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s1">&#39;awsdecomm&#39;</span><span class="o">][</span><span class="s1">&#39;mail_to&#39;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>      <span class="ss">:mail_from</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s1">&#39;awsdecomm&#39;</span><span class="o">][</span><span class="s1">&#39;mail_from&#39;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>      <span class="ss">:smtp_addr</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s1">&#39;awsdecomm&#39;</span><span class="o">][</span><span class="s1">&#39;smtp_address&#39;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>      <span class="ss">:smtp_port</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s1">&#39;awsdecomm&#39;</span><span class="o">][</span><span class="s1">&#39;smtp_port&#39;</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>      <span class="ss">:smtp_domain</span> <span class="o">=&gt;</span> <span class="n">settings</span><span class="o">[</span><span class="s1">&#39;awsdecomm&#39;</span><span class="o">][</span><span class="s1">&#39;smtp_domain&#39;</span><span class="o">]</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="n">body</span> <span class="o">=</span> <span class="o">&lt;&lt;-</span><span class="no">BODY</span><span class="o">.</span><span class="n">gsub</span><span class="p">(</span><span class="sr">/^ {14}/</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">)</span>
+</span><span class='line'><span class="sh">            #{@event[&#39;check&#39;][&#39;output&#39;]}</span>
+</span><span class='line'><span class="sh">            Host: #{@event[&#39;client&#39;][&#39;name&#39;]}</span>
+</span><span class='line'><span class="sh">            Timestamp: #{Time.at(@event[&#39;check&#39;][&#39;issued&#39;])}</span>
+</span><span class='line'><span class="sh">            Address:  #{@event[&#39;client&#39;][&#39;address&#39;]}</span>
+</span><span class='line'><span class="sh">            Check Name:  #{@event[&#39;check&#39;][&#39;name&#39;]}</span>
+</span><span class='line'><span class="sh">            Command:  #{@event[&#39;check&#39;][&#39;command&#39;]}</span>
+</span><span class='line'><span class="sh">            Status:  #{@event[&#39;check&#39;][&#39;status&#39;]}</span>
+</span><span class='line'><span class="sh">            Occurrences:  #{@event[&#39;occurrences&#39;]}</span>
+</span><span class='line'><span class="no">          BODY</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="k">case</span> <span class="n">subject</span>
+</span><span class='line'>      <span class="k">when</span> <span class="s2">&quot;success&quot;</span>
+</span><span class='line'>        <span class="nb">sub</span> <span class="o">=</span> <span class="s2">&quot;Decommission of </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> was successful.&quot;</span>
+</span><span class='line'>      <span class="k">when</span> <span class="s2">&quot;alert&quot;</span>
+</span><span class='line'>        <span class="nb">sub</span> <span class="o">=</span> <span class="s2">&quot;ALERT - </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">/</span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;check&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">: </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;check&#39;</span><span class="o">][</span><span class="s1">&#39;notification&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>      <span class="k">when</span> <span class="s2">&quot;resolve&quot;</span>
+</span><span class='line'>        <span class="nb">sub</span> <span class="o">=</span> <span class="s2">&quot;RESOLVED - </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">/</span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;check&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">: </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;check&#39;</span><span class="o">][</span><span class="s1">&#39;notification&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>      <span class="k">else</span>
+</span><span class='line'>        <span class="nb">sub</span> <span class="o">=</span> <span class="s2">&quot;FAILURE: Decommission of </span><span class="si">#{</span><span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;client&#39;</span><span class="o">][</span><span class="s1">&#39;name&#39;</span><span class="o">]</span><span class="si">}</span><span class="s2"> failed.&quot;</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="k">if</span> <span class="vi">@body</span> <span class="o">!=</span> <span class="s2">&quot;&quot;</span> <span class="k">then</span> <span class="n">body</span> <span class="o">=</span> <span class="vi">@body</span> <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="no">Mail</span><span class="o">.</span><span class="n">defaults</span> <span class="k">do</span>
+</span><span class='line'>      <span class="n">delivery_method</span> <span class="ss">:smtp</span><span class="p">,</span> <span class="p">{</span>
+</span><span class='line'>        <span class="ss">:address</span> <span class="o">=&gt;</span> <span class="n">params</span><span class="o">[</span><span class="ss">:smtp_addr</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:port</span>    <span class="o">=&gt;</span> <span class="n">params</span><span class="o">[</span><span class="ss">:smtp_port</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:domain</span>  <span class="o">=&gt;</span> <span class="n">params</span><span class="o">[</span><span class="ss">:smtp_domain</span><span class="o">]</span><span class="p">,</span>
+</span><span class='line'>        <span class="ss">:openssl_verify_mode</span> <span class="o">=&gt;</span> <span class="s1">&#39;none&#39;</span>
+</span><span class='line'>      <span class="p">}</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>    <span class="k">begin</span>
+</span><span class='line'>      <span class="n">timeout</span> <span class="mi">10</span> <span class="k">do</span>
+</span><span class='line'>        <span class="no">Mail</span><span class="o">.</span><span class="n">deliver</span> <span class="k">do</span>
+</span><span class='line'>          <span class="n">to</span>      <span class="n">params</span><span class="o">[</span><span class="ss">:mail_to</span><span class="o">]</span>
+</span><span class='line'>          <span class="n">from</span>    <span class="n">params</span><span class="o">[</span><span class="ss">:mail_from</span><span class="o">]</span>
+</span><span class='line'>          <span class="n">subject</span> <span class="nb">sub</span>
+</span><span class='line'>          <span class="n">body</span>    <span class="n">body</span>
+</span><span class='line'>        <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="nb">puts</span> <span class="s2">&quot;mail -- </span><span class="si">#{</span><span class="nb">sub</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>      <span class="k">end</span>
+</span><span class='line'>    <span class="k">rescue</span> <span class="ss">Timeout</span><span class="p">:</span><span class="ss">:Error</span>
+</span><span class='line'>      <span class="nb">puts</span> <span class="s2">&quot;mail -- timed out while attempting to deliver message </span><span class="si">#{</span><span class="nb">sub</span><span class="si">}</span><span class="s2">&quot;</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'>  <span class="k">def</span> <span class="nf">handle</span>
+</span><span class='line'>    <span class="k">if</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;create&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">check_aws</span>
+</span><span class='line'>      <span class="n">mail</span><span class="p">(</span><span class="s1">&#39;success&#39;</span><span class="p">)</span>
+</span><span class='line'>    <span class="k">elsif</span> <span class="vi">@event</span><span class="o">[</span><span class="s1">&#39;action&#39;</span><span class="o">].</span><span class="n">eql?</span><span class="p">(</span><span class="s1">&#39;resolve&#39;</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">mail</span><span class="p">(</span><span class="s1">&#39;resolve&#39;</span><span class="p">)</span>
+</span><span class='line'>    <span class="k">end</span>
+</span><span class='line'>  <span class="k">end</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">end</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>We need to update the settings json for the new mail configuration settings.</p>
+
+<figure class='code'><figcaption><span>decomm.json </span></figcaption>
+<div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class='json'><span class='line'><span class="p">{</span>
+</span><span class='line'>  <span class="nt">&quot;decomm&quot;</span><span class="p">:{</span>
+</span><span class='line'>    <span class="nt">&quot;access_key_id&quot;</span><span class="p">:</span> <span class="s2">&quot;ACCESS_KEY_ID&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;secret_access_key&quot;</span><span class="p">:</span> <span class="s2">&quot;SECRET_ACCESS_KEY&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;mail_from&quot;</span><span class="p">:</span> <span class="s2">&quot;sensu@example.com&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;mail_to&quot;</span><span class="p">:</span> <span class="s2">&quot;nobody@example.com&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;smtp_address&quot;</span><span class="p">:</span> <span class="s2">&quot;localhost&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;smtp_port&quot;</span><span class="p">:</span> <span class="s2">&quot;25&quot;</span><span class="p">,</span>
+</span><span class='line'>    <span class="nt">&quot;smtp_domain&quot;</span><span class="p">:</span> <span class="s2">&quot;localhost&quot;</span>
+</span><span class='line'>  <span class="p">}</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>Now What?</h2>
+
+<p>At this point we have a decommission script that performs some basic actions by removing clients from sensu or alerting us if the instance exists and not sending keepalives.  At this point you can add additional logic to remove clients from Chef/Puppet or other monitoring tools.  I&rsquo;ve also removed rescue, retry and failure logic to each of the API calls in this example.</p>
+
+<p>This blog is meant to be a guide.  I didn&rsquo;t test this code but it&rsquo;s losely based on the handler that I wrote so in general it should work.</p>
+
+<p>My original decomm handler is <a href="https://github.com/agent462/sensu-handler-awsdecomm">here</a>.  It&rsquo;s intentionally verbose but a little messy.  One of these days I&rsquo;ll clean it up.</p>
+]]></content>
+  </entry>
   
 </feed>
