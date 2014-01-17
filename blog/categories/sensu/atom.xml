@@ -4,7 +4,7 @@
   <title><![CDATA[Category: Sensu | agent462]]></title>
   <link href="http://agent462.github.io/blog/categories/sensu/atom.xml" rel="self"/>
   <link href="http://agent462.github.io/"/>
-  <updated>2014-01-15T23:34:16-06:00</updated>
+  <updated>2014-01-16T23:45:01-06:00</updated>
   <id>http://agent462.github.io/</id>
   <author>
     <name><![CDATA[agent462]]></name>
@@ -20,7 +20,11 @@
     <id>http://agent462.github.io/blog/2014/01/14/sensu-automated-decommission-of-clients</id>
     <content type="html"><![CDATA[<p>Awhile back, I wrote a <a href="https://github.com/agent462/sensu-handler-awsdecomm">handler</a> to decommission clients from sensu and chef when they had been terminated or shut down in AWS.</p>
 
-<p>The key to writing your own decommission handler is to inspect nodes that are firing <a href="http://sensuapp.org/docs/0.12/keepalives">keepalive</a> events.</p>
+<h2>Why?</h2>
+
+<p>Sensu doesn&rsquo;t magically know why your server is missing.  The server could be dead, impacted by a network partition or you just killed the thing on purpose.  The same thing goes for almost every system you are using.  Chef, Puppet, a CMDB, etc may not understand what the real state of your server is supposed to be.  You can use Sensu to changes states in your different systems.  In this specific example we&rsquo;ll check the AWS API to see if a server is terminated or shutting down and then go remove it from Sensu.  You could continue to remove the server from Chef, your CMDB, etc.  You could also get fancy and move metrics in graphite to an archive folder, delete snapshots, images, etc.</p>
+
+<p>The key to writing your own decommission handler is to inspect nodes that are firing Sensu <a href="http://sensuapp.org/docs/0.12/keepalives">keepalive</a> events.</p>
 
 <h2>Keepalives</h2>
 
