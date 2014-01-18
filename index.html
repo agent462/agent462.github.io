@@ -112,9 +112,9 @@
 
 <p>Sensu doesn&rsquo;t magically know why your server is missing.  The server could be dead, impacted by a network partition or you just killed the thing on purpose.  The same thing goes for almost every system you are using.  Chef, Puppet, a CMDB, etc may not understand what the real state of your server is supposed to be.  You can use Sensu to change states in your different systems.  In this specific example we&rsquo;ll check the AWS API to see if a server is terminated or shutting down and then go remove it from Sensu.  You could continue to remove the server from Chef, your CMDB, etc.  You could also get fancy and move metrics in graphite to an archive folder, delete snapshots, images, etc.</p>
 
-<p>The key to writing your own decommission handler is to inspect nodes that are firing Sensu <a href="http://sensuapp.org/docs/0.12/keepalives">keepalive</a> events.</p>
-
 <h2>Keepalives</h2>
+
+<p>The key to writing your own decommission handler is to inspect nodes that are firing Sensu <a href="http://sensuapp.org/docs/0.12/keepalives">keepalive</a> events.</p>
 
 <p>Let&rsquo;s start by doing a review of what Sensu keepalive checks are.  Keepalive checks publish data about the client with a current timestamp every 20 seconds.  The server inspects this keepalive data for clients that have passed a given threshold.  The threshold is configurable but the defaults will warn you at 120 seconds and go critical at 180 seconds.</p>
 
